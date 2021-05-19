@@ -1,0 +1,20 @@
+/* 	Author: Mladen Vidic
+	E-mail: mladen.vidic@gmail.com
+	Date Signed: 12.5.2021.
+   	Location: Belgrade, Serbia; Doboj, Bosnia and Herzegovina.
+	
+	LICENCE: This code, description and conclusion can be only used for code review and commenting. 
+	Using any part of the code for commercial and open source software is prohibited without direct approval of the author. 
+	If the prohibition of use in commercial and open source software is violated without the consent of the author, it is possible that 
+	copyright protection will be sought through legal means. 
+	
+	Using the code or its parts as examples and demonstration for high school or public university education or books editing 
+	can be easily approved by author if you just note him by e-mail and if you emphasize in a visible way the unequivocal authorship of the said author. 
+	If you find useful to mention parts of this demo in presentations, online seminars (webinar) and online meetings or by other presentation channels, 
+	you are authorized to do so under the same conditions as previous for education.
+	
+	If you find that some part of the code is good enough for your commercial usage in a software, please ask.
+	Of course, if you find that the code is important for you for further work and some business cooperation, ie writing software for you, for giving 
+	advice or consulting activities, you can contact the author via e-mail address. 
+	
+*/
