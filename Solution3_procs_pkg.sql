@@ -20,13 +20,12 @@ define UMDBLINKREMOTE=@dblink_to_um
 ---------------------------- API -----------------------------
 CREATE OR REPLACE Package &&bill_calc..MV_Bill_Calc_API IS	
 	
+	-- Note: performance results could be similar if we create indexes or bitmap indexes or partitions by client and year and month.
+
 	/* Slower VERSION 0A.: First extracts clients for the month and then calls for each client separately.
 	*/
 	procedure createAllBillsForMonthYearSlowLocally (p_month in integer, p_year in integer); -- , status out integer???
-		
-	-- Note: performance results could be similar if we create indexes or bitmap indexes or partitions by client and year and month.
-	procedure createClientBillForMonthYearLocally (p_month in integer, p_year in integer, p_client_id in number); -- , status out integer???
-
+	
 	/* Fast locally VERSION 0B.:
 	*/
 	procedure createAllBillsForMonthYearFastLocally (p_month in integer, p_year in integer); -- , status out integer???
@@ -50,11 +49,18 @@ CREATE OR REPLACE Package &&bill_calc..MV_Bill_Calc_API IS
 	*/
 	procedure createAllBillsForMonthYearFastRemoteDynamicDBL5 (	p_month in integer, p_year in integer, 
 																p_user_schema in varchar2, p_remote_dblink in varchar2);
-	
+		
 	/* Maybe, if I would have time! It would be VERSION 6.
 	procedure createAllBillsForMonthYearWithoutCursorsEmbededQueries (p_month in integer, p_year in integer, remote_dblink in varchar2);
 	Not included in the implementation of the package.
 	*/
+		
+	/* VERSION 7. If p_with_tran_controle is true, then it will support commit after each client if creating bill was successful, or it will roll back 
+		part of the changes were finished for unsuccessful bill calculation and commit just log information about it.
+	*/
+	procedure createAllBillsForMonthYearRemoteDynamicDBL7Trans (p_month in integer, p_year in integer,
+															p_user_schema in varchar2, p_remote_dblink in varchar2,
+															p_with_tran_control in boolean default true);
 	
 	procedure logPriceWasMissed(p_month in integer, p_year in integer, p_client_id in number, 
 								p_type_id in number, p_first_ud in date, p_last_ud in date, p_quantity in number,
@@ -87,7 +93,7 @@ CREATE OR REPLACE Package &&bill_calc..MV_Bill_Calc_API IS
 		integrate these results for calculation of the final query result in the procedure where query 
 		called for execution.	
 	*/
-
+	
 END;
 /
 
@@ -97,28 +103,10 @@ END;
 
 CREATE OR REPLACE Package Body &&bill_calc..MV_Bill_Calc_API IS
 	
-	-- Slower version: First extracts just clients for the month and year, then calls for each client separately 
-	-- the procedure that reads again other data about that client from the same table.	
-	procedure createAllBillsForMonthYearSlowLocally (p_month in integer, p_year in integer)  
-	is		
-		cursor curClients_MonthYear is
-				select client_id							-- or change to: select DISTINCT client_id 
-				from &&usage_mgmt..USAGES	--&&UMDBLINKLOCAL
-				where extract (year from u_date)=p_year 
-				and extract (month from u_date)=p_month
-				group by client_id;							-- without: 	group by client_id 
-				
-	begin 
-		for itemC_ClientsMY in curClients_MonthYear
-		LOOP
-			createClientBillForMonthYearLocally (p_month, p_year, itemC_ClientsMY.client_id);			
-		END LOOP; --curClients_MonthYear
-		
-		/* It is better has no exception that situation can be escalated to calling procedure to handle errors
-			in semantic context 
-		*/		
-	end; 	
-		
+	/*	Should be hidden just in the package body.
+	procedure createClientBillForMonthYearLocally (p_month in integer, p_year in integer, p_client_id in number); -- , status out integer???
+	*/
+
 	procedure createClientBillForMonthYearLocally (p_month in integer, p_year in integer, p_client_id in number)  
 	is		
 		cursor curBill_Total is
@@ -228,7 +216,28 @@ CREATE OR REPLACE Package Body &&bill_calc..MV_Bill_Calc_API IS
 		*/		
 	end;	
 
-	
+	-- Slower version: First extracts just clients for the month and year, then calls for each client separately 
+	-- the procedure that reads again other data about that client from the same table.	
+	procedure createAllBillsForMonthYearSlowLocally (p_month in integer, p_year in integer)  
+	is		
+		cursor curClients_MonthYear is
+				select client_id							-- or change to: select DISTINCT client_id 
+				from &&usage_mgmt..USAGES	--&&UMDBLINKLOCAL
+				where extract (year from u_date)=p_year 
+				and extract (month from u_date)=p_month
+				group by client_id;							-- without: 	group by client_id 
+				
+	begin 
+		for itemC_ClientsMY in curClients_MonthYear
+		LOOP
+			createClientBillForMonthYearLocally (p_month, p_year, itemC_ClientsMY.client_id);			
+		END LOOP; --curClients_MonthYear
+		
+		/* It is better has no exception that situation can be escalated to calling procedure to handle errors
+			in semantic context 
+		*/		
+	end; 	
+
 	-- Fast locally version: In the same query extracts clients for the month and their bill total values.
 	procedure createAllBillsForMonthYearFastLocally (p_month in integer, p_year in integer)  
 	is		
@@ -683,6 +692,204 @@ CREATE OR REPLACE Package Body &&bill_calc..MV_Bill_Calc_API IS
 			when other then
 				-- Similar as the previous comment.
 				null;
+		*/		
+	end;	
+	
+	/*	Should be hidden just in the package body.													
+	procedure createClientBillForMonthYearFastRemoteDynamicTrans (p_month in integer, p_year in integer, p_client_id in number,
+																p_user_schema_prefix in varchar2, p_remote_dblink_sufix in varchar2,
+																p_with_tran_control in boolean default true);														
+	*/
+	procedure createClientBillForMonthYearFastRemoteDynamicTrans (p_month in integer, p_year in integer, p_client_id in number,
+																p_user_schema_prefix in varchar2, p_remote_dblink_sufix in varchar2,
+																p_with_tran_control in boolean default true)
+	is		
+		l_str_bt varchar2(500);
+		l_str_bst varchar2(750);
+		l_str_bi varchar2(1000);
+		
+		l_str_plsql varchar2(500);		
+		
+		l_unit_of_measure number;
+		
+		cvCTX_Bills_Total SYS_REFCURSOR;  -- cursor variable
+		cvCTX_Bill_Subtotal SYS_REFCURSOR;  -- cursor variable
+		cvCTX_Bill_Item SYS_REFCURSOR;  -- cursor variable
+		
+		itemC_BT t_ctx_bt_row;		
+		itemC_BST t_ctx_bst_row;		
+		itemC_BI t_ctx_bi_row;		
+				
+		l_bt_id 	number;
+		l_bst_id 	number;
+		l_bi_id		number;
+	
+	
+	begin	
+		--set sys_context('BILL_CALC_TO_USAGES','scp_year') na p_year u udaljenoj bazi
+		l_str_plsql:='MV_bill_calc_usages_API.set_parameter'||p_remote_dblink_sufix||'(''scp_year'','''||to_char(p_year)||''')';
+		EXECUTE IMMEDIATE l_str_plsql;
+		--sys_context('BILL_CALC_TO_USAGES','scp_month') na p_month u udaljenoj bazi
+		l_str_plsql:='MV_bill_calc_usages_API.set_parameter'||p_remote_dblink_sufix||'(''scp_month'','''||to_char(p_month)||''')';
+		EXECUTE IMMEDIATE l_str_plsql;
+		
+		l_str_bt:='select /* +FIRST_ROW */ client_id, first_bt_ud, last_bt_ud, bt_cost from '
+				||p_user_schema_prefix||'CTX_V_USAGES_BT'||p_remote_dblink_sufix||' '
+				||'where client_id='||p_client_id;
+				
+		open cvCTX_Bills_Total for l_str_bt;		
+		LOOP
+		    fetch cvCTX_Bills_Total into itemC_BT;
+			exit when cvCTX_Bills_Total%NOTFOUND;
+			
+			select BILL_TOTAL_seq.nextval into l_bt_id from dual;
+			
+			insert into BILL_TOTAL (ID, CLIENT_ID, BT_MONTH, BT_YEAR, FIRST_USAGE_DATE, LAST_USAGE_DATE, COST)
+			values (l_bt_id, itemC_BT.client_id, p_month, p_year, itemC_BT.first_bt_ud, itemC_BT.last_bt_ud, itemC_BT.bt_cost);
+						
+			--set sys_context('BILL_CALC_TO_USAGES','scp_client_id') na p_client_id u udaljenoj bazi
+			l_str_plsql:='MV_bill_calc_usages_API.set_parameter'||p_remote_dblink_sufix||'(''scp_client_id'','''||to_char(p_client_id)||''')';
+			EXECUTE IMMEDIATE l_str_plsql;
+			
+			l_str_bst:='select /* +ALL_ROWS */ unit_of_measure, bst_quantity, bst_cost from '
+				||p_user_schema_prefix||'CTX_V_USAGES_BST'||p_remote_dblink_sufix;
+			
+			open cvCTX_Bill_Subtotal for l_str_bst;			
+			LOOP
+				fetch cvCTX_Bill_Subtotal into itemC_BST;
+				exit when cvCTX_Bill_Subtotal%NOTFOUND;
+				
+				select BILL_SUBTOTAL_seq.nextval into l_bst_id from dual;
+				
+				insert into BILL_SUBTOTAL (ID, BILL_TOTAL_ID, UNIT_OF_MEASURE, QUANTITY, COST)
+				values (l_bst_id, l_bt_id, itemC_BST.unit_of_measure, itemC_BST.bst_quantity, itemC_BST.bst_cost);
+				
+				l_unit_of_measure:=itemC_BST.unit_of_measure;				
+				--set sys_context('BILL_CALC_TO_USAGES','scp_unit_of_measure') na l_unit_of_measure u udaljenoj bazi
+				l_str_plsql:='MV_bill_calc_usages_API.set_parameter'||p_remote_dblink_sufix||'(''scp_unit_of_measure'','''||to_char(l_unit_of_measure)||''')';
+				EXECUTE IMMEDIATE l_str_plsql;
+				
+				
+				l_str_bi:='select /* +ALL_ROWS */ type_id, price, first_bi_ud, last_bi_ud, bi_quantity, bi_cost, c_times from '
+				||p_user_schema_prefix||'CTX_V_USAGES_BI'||p_remote_dblink_sufix;
+			
+				open cvCTX_Bill_Item for l_str_bi;
+				LOOP					
+					fetch cvCTX_Bill_Item into itemC_BI;
+					exit when cvCTX_Bill_Item%NOTFOUND;
+					
+					if itemC_BI.price is null then
+						if p_with_tran_control then
+							rollback; -- Rall back changes were done for current user and then log price info.
+						end if;
+					
+						logPriceWasMissed(p_month, p_year, p_client_id, 
+								itemC_BI.type_id, itemC_BI.first_bi_ud, itemC_BI.last_bi_ud, itemC_BI.bi_quantity,
+								l_unit_of_measure, itemC_BI.c_times, p_user_schema_prefix, p_remote_dblink_sufix);
+						
+						--o_status:=1; not needed status
+					
+					/* 	if (needs to brake here for current client when price is unknown for the first time) then */
+						close cvCTX_Bill_Item;
+						close cvCTX_Bill_Subtotal;
+						close cvCTX_Bills_Total;
+						return; 
+					/*	end if;
+					*/ -- ATTENTION: Don't use exit without closed cursors regularly if you intent to exit from both FOR loops.
+					end if;
+					
+					select BILL_ITEM_seq.nextval into l_bi_id from dual;
+					
+					insert into BILL_ITEM (ID, BILL_SUBTOTAL_ID, USAGE_TYPE_ID, 
+											FIRST_USAGE_DATE, LAST_USAGE_DATE, QUANTITY, UNIT_OF_MEASURE, PRICE, COST)
+					values (l_bi_id, l_bst_id, itemC_BI.type_id, 
+							itemC_BI.first_bi_ud, itemC_BI.last_bi_ud, itemC_BI.bi_quantity, l_unit_of_measure, 
+							nvl(itemC_BI.price,0), itemC_BI.bi_cost);			
+				END LOOP; --cvCTX_Bill_Item 
+				close cvCTX_Bill_Item;
+				
+			END LOOP; --cvCTX_Bill_Subtotal
+			close cvCTX_Bill_Subtotal;
+			
+		END LOOP; --cvCTX_Bills_Total
+		close cvCTX_Bills_Total;
+		
+		if p_with_tran_control then
+			commit;
+		end if;
+		
+		/* It is better has no exception that situation can be escalated to calling procedure to handle errors
+			in semantic context 
+		*/
+		
+		/*exception
+			when no_data_found then
+				-- If error is handled here, than we must extend procedure by status to return error code.
+				-- Usually, it is semantically enclosed by an application context of usage.
+				null;
+			when other then
+				-- Similar as the previous comment.
+				null;
+		*/		
+	end;
+	
+	procedure createAllBillsForMonthYearRemoteDynamicDBL7Trans (p_month in integer, p_year in integer,
+															p_user_schema in varchar2, p_remote_dblink in varchar2,
+															p_with_tran_control in boolean default true)  
+	is		
+		l_str_bt varchar2(500);		
+		
+		l_str_plsql varchar2(500);
+		
+		l_client_id number;
+		
+		l_user_schema_prefix varchar2(128);
+		l_remote_dblink_sufix varchar2(256);
+		
+		cvCTX_Clients SYS_REFCURSOR;  -- cursor variable
+		
+	begin 
+		if p_user_schema is null then
+			l_user_schema_prefix:='';
+		else
+			l_user_schema_prefix:=p_user_schema||'.';
+		end if;
+		
+		if p_remote_dblink is null or (substr(p_remote_dblink,1,1)='@' and substr(p_remote_dblink,2)='') then
+			l_remote_dblink_sufix:='';
+		else
+			if instr(p_remote_dblink,'@',1,1)>0 then
+				l_remote_dblink_sufix:=p_remote_dblink;
+			else
+				l_remote_dblink_sufix:='@'||p_remote_dblink;
+			end if;
+		end if;
+		
+		--set sys_context('BILL_CALC_TO_USAGES','scp_year') na p_year u udaljenoj bazi
+		l_str_plsql:='MV_bill_calc_usages_API.set_parameter'||l_remote_dblink_sufix||'(''scp_year'','''||to_char(p_year)||''')';
+		EXECUTE IMMEDIATE l_str_plsql;
+		
+		--sys_context('BILL_CALC_TO_USAGES','scp_month') na p_month u udaljenoj bazi
+		l_str_plsql:='MV_bill_calc_usages_API.set_parameter'||l_remote_dblink_sufix||'(''scp_month'','''||to_char(p_month)||''')';
+		EXECUTE IMMEDIATE l_str_plsql;
+		
+		l_str_bt:='select /* +ALL_ROWS */ client_id from '
+				||l_user_schema_prefix||'CTX_V_USAGES_BT'||l_remote_dblink_sufix;				
+		
+		open cvCTX_Clients for l_str_bt;		
+		LOOP
+		    fetch cvCTX_Clients into l_client_id;
+			exit when cvCTX_Clients%NOTFOUND;		
+		
+			createClientBillForMonthYearFastRemoteDynamicTrans (p_month, p_year, l_client_id,
+																l_user_schema_prefix, l_remote_dblink_sufix, 
+																p_with_tran_control);
+			-- It will commit records for the user or will commit just last log after previously had roll back all changes for that user
+		END LOOP; --curClients_MonthYear
+		close cvCTX_Clients;
+		
+		/* It is better has no exception that situation can be escalated to calling procedure to handle errors
+			in semantic context 
 		*/		
 	end;
 	
